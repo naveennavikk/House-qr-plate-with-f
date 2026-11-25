@@ -81,3 +81,8 @@ Example automatic rejection:
 For manual review the calling backend can store the `Remark` so reviewers see why the pair was flagged, while leaving `QRStatus` unset. It can set `QRStatusDate` and `modified` according to its own record-update rules.
 
 See [LOAD_TEST_REPORT.md](LOAD_TEST_REPORT.md) for the local synthetic throughput and latency measurements, test limitations, and recommended scale tests.
+
+## Plate-visibility and orientation checks
+
+- `models/plate_detector.pt` (`plate_detector.py`) is a YOLO detector that answers "is any QR plate visible in the property image?". When the matcher cannot confirm the plate and the detector finds none, or when the matcher accepted without a background check but the detector finds no plate at all, the pair is rejected with "Plate not shown in property image." Thresholds: `QR_PLATE_PRESENT_THRESHOLD` (0.1), `QR_PLATE_VISIBLE_THRESHOLD` (0.55), `QR_PLATE_VETO_THRESHOLD` (0.05). Retrain with `training/train_plate_detector.py`.
+- `models/orientation_cls.pt` (`image_checks.py`) catches photos taken sideways: the file is portrait but the scene is rotated 90 degrees. Both images are checked before matching, and a sideways photo is rejected with the horizontal-image remark. Threshold: `QR_SIDEWAYS_THRESHOLD` (0.99). Retrain with `training/train_image_checks.py`.

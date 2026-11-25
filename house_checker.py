@@ -68,10 +68,19 @@ def _download_encoder() -> None:
  
  
 class HouseDoorChecker:
-    def __init__(self, threshold: float | None = None):
+    def __init__(self, threshold: float | None = None, device: str | None = None):
         if not ENCODER_PATH.exists():
             _download_encoder()
-        self.encoder = torch.jit.load(str(ENCODER_PATH), map_location="cpu").float().eval()
+        self.device = str(device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+        try:
+            self.encoder = torch.jit.load(str(ENCODER_PATH), map_location=self.device).float().eval()
+            if self.device != "cpu":
+                # Traced models can carry CPU-only ops; verify once, else use the CPU.
+                with torch.inference_mode():
+                    self.encoder.encode_image(torch.zeros(1, 3, 224, 224, device=self.device))
+        except Exception:
+            self.device = "cpu"
+            self.encoder = torch.jit.load(str(ENCODER_PATH), map_location="cpu").float().eval()
         probe = json.loads(PROBE_PATH.read_text())
         self.w = np.asarray(probe["weights"], dtype=np.float32)
         self.b = float(probe["bias"])
@@ -99,7 +108,7 @@ class HouseDoorChecker:
         if not isinstance(image, Image.Image):
             image = Image.open(image)
         with torch.inference_mode():
-            emb = self.encoder.encode_image(self._preprocess(image))[0].numpy()
+            emb = self.encoder.encode_image(self._preprocess(image).to(self.device))[0].float().cpu().numpy()
         return emb / (np.linalg.norm(emb) + 1e-8)
 
     def _knn_score(self, emb: np.ndarray) -> float:

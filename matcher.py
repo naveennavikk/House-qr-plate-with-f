@@ -404,29 +404,16 @@ class HybridImageMatcher:
             qr_gray = ref_gray[max(0, y1):min(ref_gray.shape[0], y2), max(0, x1):min(ref_gray.shape[1], x2)]
             ref_sharpness = self._normalized_patch_sharpness(qr_gray)
             if min(qr_gray.shape[:2], default=0) < 24 or ref_sharpness < 700:
-                return {
-                    "contains_reference": False,
-                    "needs_manual_review": True,
-                    "detection_method": "manual_review",
-                    "manual_review_reason": "The reference QR plate image is too blurry or too small to verify reliably.",
-                    "reference_sharpness": ref_sharpness,
-                }
+                out = self._reject(self.REMARK_RESCAN, "reference QR plate too blurry or too small")
+                out["reference_sharpness"] = ref_sharpness
+                return out
         elif min(ref_img.size) < 220 or self._sharpness(ref_gray) < 45:
-            return {
-                "contains_reference": False,
-                "needs_manual_review": True,
-                "detection_method": "manual_review",
-                "manual_review_reason": "The reference image is too unclear to locate the QR plate reliably.",
-            }
+            return self._reject(self.REMARK_RESCAN, "reference image too unclear to locate the QR plate")
 
         if self._sharpness(prop_gray) < 12:
-            return {
-                "contains_reference": False,
-                "needs_manual_review": True,
-                "detection_method": "manual_review",
-                "manual_review_reason": "The property image is too blurry to verify the plate and its surroundings.",
-                "property_sharpness": self._sharpness(prop_gray),
-            }
+            out = self._reject(self.REMARK_PROPERTY, "property image too blurry")
+            out["property_sharpness"] = self._sharpness(prop_gray)
+            return out
 
         # Different plates share the same printed layout, so visual features
         # alone can match two different plates on similar walls. When both QR
@@ -443,11 +430,17 @@ class HybridImageMatcher:
             }
 
         self._local.candidates = []
+        self._local.qr_min_area = None
+        self._local.qr_confident = None
         try:
             result = self._verify_presence_core(ref_img, property_img, target_prompt)
             candidates = self._local.candidates
+            qr_min_area = self._local.qr_min_area
+            qr_confident = self._local.qr_confident
         finally:
             self._local.candidates = None
+            self._local.qr_min_area = None
+            self._local.qr_confident = None
         if not result.get("contains_reference") and candidates:
             plates = [c for c in candidates if c["plate_like"]]
             best = max(plates, key=lambda c: c["score"]) if plates else None
@@ -460,31 +453,84 @@ class HybridImageMatcher:
                     "background_similarity": best["score"],
                     "candidate_qr_box": best["box"],
                 }
-            return {
-                "contains_reference": False,
-                "needs_manual_review": True,
-                "detection_method": "manual_review",
-                "manual_review_reason": (
-                    "The plate could not be located in the property image."
-                    if best is None else
-                    "A plate was found but its surroundings are only a partial match."
-                ),
-                "background_similarity": best["score"] if best else None,
-            }
-        if result.get("recognition_uncertain") or result.get("detection_method") in {
-            "QR symbol not localized; use clearer original images",
-            "QR candidate found but background could not be validated",
-        }:
-            result.update({
-                "contains_reference": False,
-                "needs_manual_review": True,
-                "detection_method": "manual_review",
-                "manual_review_reason": result.get(
-                    "manual_review_reason",
-                    "The matcher could not confidently locate the QR plate. Please confirm the plate and its nearby background.",
-                ),
-            })
+            if best:
+                # Surroundings score between CONTEXT_REJECT and CONTEXT_ACCEPT.
+                # On labelled data these were mostly genuine plates (20 of 23).
+                return {
+                    "contains_reference": True,
+                    "detection_method": "plate found; surroundings partially match",
+                    "background_similarity": best["score"],
+                    "candidate_qr_box": best["box"],
+                }
+            if result.get("feature_inliers"):
+                # The QR was located by a homography-verified feature match, but
+                # the plate is angled/curved (e.g. on a tree), so the plate-design
+                # gate failed. Location is reliable: judge it on the raw
+                # surroundings score as usual.
+                feat = [c for c in candidates if c["box"] == list(result.get("candidate_qr_box") or [])]
+                raw = max((c["score"] for c in feat or candidates), default=0.0)
+                if raw >= self.CONTEXT_REJECT:
+                    return {
+                        "contains_reference": True,
+                        "detection_method": "QR feature match + surroundings (plate angled)",
+                        "background_similarity": float(raw),
+                        "feature_inliers": result["feature_inliers"],
+                        "candidate_qr_box": result.get("candidate_qr_box"),
+                    }
+                return {
+                    "contains_reference": False,
+                    "detection_method": "plate found; wall or plate marks differ",
+                    "background_similarity": float(raw),
+                    "candidate_qr_box": result.get("candidate_qr_box"),
+                }
+            if qr_confident:
+                # The detector confidently boxed a plate-sized QR, but the plate
+                # is too small/soft for its printed design to be verified, so the
+                # background cannot be compared. Labelled data: 48/57 genuine
+                # pairs here vs 2 plate-missing photos.
+                score, box = qr_confident
+                return {
+                    "contains_reference": True,
+                    "background_checked": False,
+                    "detection_method": "plate found; background not checkable",
+                    "match_score": float(score),
+                    "candidate_qr_box": [int(v) for v in box],
+                }
+            # No plate found anywhere in the property image: reject.
+            out = self._reject(self.REMARK_NOT_VISIBLE, "plate not located in property image")
+            out["qr_box_area"] = qr_min_area
+            return out
+        if result.get("recognition_uncertain"):
+            return self._decide_by_qr_size(qr_min_area, result.get("detection_method"))
+        if result.get("detection_method") == "QR symbol not localized; use clearer original images":
+            return self._reject(self.REMARK_RESCAN, result["detection_method"])
         return result
+
+    # Grounding DINO labels house numbers and signs as "qr code" too, but those
+    # boxes are large. A real plate in a full house photo is tiny. Labelled data
+    # (detector-unsure cases): smallest QR box < 0.4% of the photo kept 53/75
+    # genuine plates and only 6/44 plate-missing photos.
+    QR_SMALL_AREA = 0.004
+    REMARK_RESCAN = "Rescan the Scanify image clearly."
+    REMARK_PROPERTY = "Property image is not proper; retake a clear photo of the property."
+    REMARK_NOT_VISIBLE = "The plate is not visible in the property image; retake it with the plate clearly visible."
+
+    @staticmethod
+    def _reject(remark, method):
+        return {"contains_reference": False, "detection_method": method, "reject_remark": remark}
+
+    def _decide_by_qr_size(self, qr_min_area, method):
+        """Accept/reject a plate the matcher could not localize precisely."""
+        if qr_min_area is not None and qr_min_area < self.QR_SMALL_AREA:
+            return {
+                "contains_reference": True,
+                "background_checked": False,
+                "detection_method": f"{method}; small QR plate detected",
+                "qr_box_area": qr_min_area,
+            }
+        out = self._reject(self.REMARK_NOT_VISIBLE, f"{method}; no plate-sized QR detected")
+        out["qr_box_area"] = qr_min_area
+        return out
 
     def _verify_presence_core(self, ref_img, property_img, target_prompt="plate . sign . house number ."):
         if not isinstance(ref_img, Image.Image):
@@ -597,10 +643,19 @@ class HybridImageMatcher:
                     accepted = (score, bbox, background_score, projected_qr)
                     break
             if not reference_qrs:
+                # The plate was found, but without a localized reference QR there
+                # is no background region to compare. Accept on the plate match.
+                x1, y1, x2, y2 = template_matches[0][1]
                 return {
-                    "contains_reference": False,
-                    "detection_method": "QR candidate found but background could not be validated",
-                    "best_template_score": best_score,
+                    "contains_reference": True,
+                    "bbox": [
+                        max(0, round(x1 / property_scale)), max(0, round(y1 / property_scale)),
+                        min(property_img.width, round(x2 / property_scale)),
+                        min(property_img.height, round(y2 / property_scale)),
+                    ],
+                    "match_score": best_score,
+                    "background_checked": False,
+                    "detection_method": "QR plate found; background not checkable",
                 }
             if accepted is None:
                 return {
@@ -649,6 +704,11 @@ class HybridImageMatcher:
                 qr_detections = [
                     d for d in detections if "qr code" in d["label"] and d["score"] >= .18
                 ]
+                if qr_detections and hasattr(self._local, "qr_min_area"):
+                    self._local.qr_min_area = min(
+                        max(0.0, float(d["box"][2] - d["box"][0])) * max(0.0, float(d["box"][3] - d["box"][1]))
+                        for d in qr_detections
+                    ) / float(width * height)
                 for detection in detections:
                     if "qr code" not in detection["label"] or detection["score"] < .28:
                         continue
@@ -665,6 +725,8 @@ class HybridImageMatcher:
                         continue
                     plausible.append((detection["score"], [x1, y1, x2, y2]))
 
+                if plausible and max(plausible)[0] >= .33 and hasattr(self._local, "qr_confident"):
+                    self._local.qr_confident = max(plausible)
                 best_dino = None
                 for detection_score, candidate_box in sorted(plausible, reverse=True):
                     if detection_score < .33:
@@ -705,11 +767,12 @@ class HybridImageMatcher:
                         "candidate_qr_box": best_dino[2],
                     }
                 if qr_detections:
+                    # A QR-like object was detected but its box is too loose to
+                    # compare the background. verify_presence decides by box size.
                     return {
                         "contains_reference": False,
                         "recognition_uncertain": True,
-                        "detection_method": "low-confidence QR candidate",
-                        "manual_review_reason": "The QR detector found a possible plate, but could not localize it confidently enough to check the background.",
+                        "detection_method": "QR detected; background not checkable",
                         "match_score": max(d["score"] for d in qr_detections),
                     }
             except Exception:

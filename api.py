@@ -21,6 +21,8 @@ from ultralytics import YOLO
 
 from house_checker import HouseDoorChecker
 from matcher import HybridImageMatcher
+from image_checks import OrientationChecker
+from plate_detector import PlateDetector
 
 APP_ROOT = Path(__file__).resolve().parent
 MODEL_PATHS = [
@@ -32,11 +34,32 @@ MAX_IMAGE_BYTES = 25 * 1024 * 1024
 # and is rejected; the small margin keeps near-square photos from being rejected.
 HORIZONTAL_ASPECT_RATIO = 1.05
 HORIZONTAL_IMAGE_REMARK = "Image is in horizontal position; send it properly in vertical position."
+# Orientation classifier (image_checks.py): a portrait file whose scene is
+# rotated 90 degrees (phone held sideways) is also a horizontal picture. 0.95 was
+# first chosen on held-out data: 20/23 horizontal pairs caught (the 3 misses are
+# not 90-degree rotations), 1/800 good photos flagged. Raised to 0.99 because an
+# upright photo looking up a tree trunk (HPSBA-A232416, a "remove plate" case)
+# scored 0.982; on 62 labelled horizontal photos 0.99 catches 26 vs 28 at 0.95.
+SIDEWAYS_THRESHOLD = float(os.getenv("QR_SIDEWAYS_THRESHOLD", "0.99"))
 # House checker (house_checker.py): after a plate match, the property image must
 # show a house with its door/gate visible, otherwise the pair is rejected.
 # QR_HOUSE_THRESHOLD overrides the threshold stored in models/house_checker/probe.json.
 HOUSE_CHECK_THRESHOLD = float(os.environ["QR_HOUSE_THRESHOLD"]) if os.getenv("QR_HOUSE_THRESHOLD") else None
 HOUSE_IMAGE_REMARK = "Property image is not proper."
+# Plate detector (plate_detector.py), used when the matcher does not accept:
+#  * best confidence < PLATE_PRESENT_THRESHOLD -> reject "plate not shown";
+#  * matcher says "not visible" but confidence >= PLATE_VISIBLE_THRESHOLD ->
+#    accept the match (plate found, background not checkable) and continue.
+# Held-out data (64 "plate not shown" pairs, 400 accept pairs): the second rule
+# recovers 20 of the matcher's 30 false "not visible" rejections without
+# letting any "plate not shown" pair through (their max was 0.51).
+PLATE_PRESENT_THRESHOLD = float(os.getenv("QR_PLATE_PRESENT_THRESHOLD", "0.1"))
+PLATE_VISIBLE_THRESHOLD = float(os.getenv("QR_PLATE_VISIBLE_THRESHOLD", "0.55"))
+#  * matcher accepted without a background check, but the detector finds no
+#    plate at all (< PLATE_VETO_THRESHOLD) -> reject "plate not shown". Held-out:
+#    6/8 such "plate not shown" accepts caught, 4/400 good pairs rejected.
+PLATE_VETO_THRESHOLD = float(os.getenv("QR_PLATE_VETO_THRESHOLD", "0.05"))
+PLATE_NOT_SHOWN_REMARK = "Plate not shown in property image."
 # Average "Accept+" probability required for automatic approval. 0.8 was chosen
 # on the validation split (see training/reports): it approved ~65% of good
 # plates while letting through far fewer rejects than the previous models.
@@ -72,7 +95,7 @@ CLASS_TO_REMARK = {
     "property image not proper": "Property image is not proper; retake a clear photo of the property.",
     "show house entrance": "Show the house entrance in the property image.",
     "show property image long distance": "Take the property image from a longer distance so the whole house and plate are visible.",
-    "remove plates": "Remove the plate.",
+    "remove plates": "Remove the QR plate from its current spot and place it in a more convenient area.",
     "remove dustbin sticker": "Remove the dustbin sticker.",
     "remove plate when wall is crack": "Wall is cracked; remove the plate.",
     "write house id no. on plate with marker": "Write the house ID number on the plate with a marker.",
@@ -119,7 +142,17 @@ def get_matcher():
 
 @lru_cache(maxsize=1)
 def get_house_checker():
-    return HouseDoorChecker(threshold=HOUSE_CHECK_THRESHOLD)
+    return HouseDoorChecker(threshold=HOUSE_CHECK_THRESHOLD, device=DEVICE)
+
+
+@lru_cache(maxsize=1)
+def get_orientation_checker():
+    return OrientationChecker(device=DEVICE)
+
+
+@lru_cache(maxsize=1)
+def get_plate_detector():
+    return PlateDetector(device=DEVICE)
 
 
 @lru_cache(maxsize=2)
@@ -267,12 +300,55 @@ def process_pair(images: ImagePair):
     # Property photos must be taken in portrait (vertical) orientation.
     if property_image.width > property_image.height * HORIZONTAL_ASPECT_RATIO:
         return result(images, qr_status=0, remark=HORIZONTAL_IMAGE_REMARK)
+    # Portrait files can still hold a sideways scene (photo taken horizontally).
+    # Checked on both photos before matching, which a rotated photo would fail.
+    try:
+        orientation = get_orientation_checker()
+        if any(orientation.sideways_probability(img) >= SIDEWAYS_THRESHOLD for img in (reference, property_image)):
+            return result(images, qr_status=0, remark=HORIZONTAL_IMAGE_REMARK)
+    except Exception as exc:
+        raise HTTPException(500, f"Orientation check failed: {exc}") from exc
     try:
         match = get_matcher().verify_presence(reference, property_image)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(500, f"Image matching failed: {exc}") from exc
+
+    # The matcher could not confirm the plate: ask the plate detector whether any
+    # QR plate is visible in the property image at all.
+    if not match.get("contains_reference"):
+        try:
+            plate_confidence = get_plate_detector().best_confidence(property_image)
+        except Exception as exc:
+            raise HTTPException(500, f"Plate detection failed: {exc}") from exc
+        if plate_confidence < PLATE_PRESENT_THRESHOLD:
+            return result(images, qr_status=0, remark=PLATE_NOT_SHOWN_REMARK)
+        if match.get("reject_remark") == HybridImageMatcher.REMARK_NOT_VISIBLE:
+            if plate_confidence >= PLATE_VISIBLE_THRESHOLD:
+                # The matcher missed a plate the detector clearly sees (usually a
+                # small, distant plate whose background cannot be compared).
+                # Plate found + background not checkable -> accept the match and
+                # continue to the inspector and house checks (no manual review).
+                match = {
+                    "contains_reference": True,
+                    "background_checked": False,
+                    "detection_method": "plate detector: plate found; background not checkable",
+                    "plate_confidence": plate_confidence,
+                }
+            else:
+                return result(images, qr_status=0, remark=PLATE_NOT_SHOWN_REMARK)
+
+    # The matcher accepted without checking the background (it only saw a
+    # QR-like box). If the plate detector finds no plate at all, the matcher
+    # boxed something else on the wall: the plate is not shown.
+    elif match.get("background_checked") is False:
+        try:
+            plate_confidence = get_plate_detector().best_confidence(property_image)
+        except Exception as exc:
+            raise HTTPException(500, f"Plate detection failed: {exc}") from exc
+        if plate_confidence < PLATE_VETO_THRESHOLD:
+            return result(images, qr_status=0, remark=PLATE_NOT_SHOWN_REMARK)
 
     if match.get("needs_manual_review"):
         return result(
@@ -286,18 +362,24 @@ def process_pair(images: ImagePair):
         return result(
             images,
             qr_status=0,
-            remark="Reference plate or its surrounding background does not match the property image.",
+            remark=match.get("reject_remark")
+            or "Reference plate or its surrounding background does not match the property image.",
         )
-    # After a match, the property image must be a proper house photo (house with
-    # its door/gate visible); otherwise reject without running the inspector.
+    # As in the UI workflow, inspect only the reference plate photo after a match.
+    inspection = inspect_reference(reference, images)
+    # A plate on a tree, pole or banner must be moved; such photos naturally
+    # fail the house check, so the remove-plate remark wins.
+    if inspection.get("Remark") == CLASS_TO_REMARK["remove plates"]:
+        return inspection
+    # Otherwise the property image must be a proper house photo (house with its
+    # door/gate visible) before any plate verdict is reported.
     try:
         house = get_house_checker().check(property_image)
     except Exception as exc:
         raise HTTPException(500, f"House image check failed: {exc}") from exc
     if not house.accepted:
         return result(images, qr_status=0, remark=HOUSE_IMAGE_REMARK)
-    # As in the UI workflow, inspect only the reference plate photo after a match.
-    return inspect_reference(reference, images)
+    return inspection
 
 
 @app.post("/api/inspect/batch")
