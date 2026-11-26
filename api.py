@@ -21,7 +21,8 @@ from ultralytics import YOLO
 
 from house_checker import HouseDoorChecker
 from matcher import HybridImageMatcher
-from image_checks import OrientationChecker
+from house_id import HouseIdReader, comparison_key, normalize_id
+from image_checks import OrientationChecker, plate_closeup_fraction
 from plate_detector import PlateDetector
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -29,11 +30,23 @@ MODEL_PATHS = [
     ("YOLO26n", APP_ROOT / "models" / "yolo26n_cls_best.pt"),
     ("YOLO11n", APP_ROOT / "models" / "yolo11n_cls_best.pt"),
 ]
+# The inspector above was retrained without a Shops class (no shop data was
+# available). The previous weights still recognise shops, so they are kept
+# only for that: if they classify the plate as Shops, the pair goes to manual review.
+LEGACY_SHOP_MODEL_PATHS = [
+    APP_ROOT / "models" / "legacy_shops" / "yolo26n_cls_best.pt",
+    APP_ROOT / "models" / "legacy_shops" / "yolo11n_cls_best.pt",
+]
+LEGACY_REMOVE_PLATES_THRESHOLD = float(os.getenv("QR_LEGACY_REMOVE_PLATES_THRESHOLD", "0.6"))
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 # A property image wider than tall by this factor counts as horizontal (landscape)
 # and is rejected; the small margin keeps near-square photos from being rejected.
 HORIZONTAL_ASPECT_RATIO = 1.05
 HORIZONTAL_IMAGE_REMARK = "Image is in horizontal position; send it properly in vertical position."
+# House ID check (house_id.py), run before every other task: the IDs stamped at
+# the bottom-left of both photos and the request's houseNo must all agree.
+# An ID that cannot be read is skipped (policy to be decided after testing).
+HOUSE_ID_MISMATCH_REMARK = "House ID mismatch"
 # Orientation classifier (image_checks.py): a portrait file whose scene is
 # rotated 90 degrees (phone held sideways) is also a horizontal picture. 0.95 was
 # first chosen on held-out data: 20/23 horizontal pairs caught (the 3 misses are
@@ -46,6 +59,10 @@ SIDEWAYS_THRESHOLD = float(os.getenv("QR_SIDEWAYS_THRESHOLD", "0.99"))
 # QR_HOUSE_THRESHOLD overrides the threshold stored in models/house_checker/probe.json.
 HOUSE_CHECK_THRESHOLD = float(os.environ["QR_HOUSE_THRESHOLD"]) if os.getenv("QR_HOUSE_THRESHOLD") else None
 HOUSE_IMAGE_REMARK = "Property image is not proper."
+# A plate close-up sent as the property image (e.g. the two photos swapped) has a
+# large, readable QR code; the property image is then not proper. See
+# image_checks.plate_closeup_fraction (238/250 close-ups vs 0/450 property photos).
+PLATE_CLOSEUP_THRESHOLD = float(os.getenv("QR_PLATE_CLOSEUP_THRESHOLD", "0.15"))
 # Plate detector (plate_detector.py), used when the matcher does not accept:
 #  * best confidence < PLATE_PRESENT_THRESHOLD -> reject "plate not shown";
 #  * matcher says "not visible" but confidence >= PLATE_VISIBLE_THRESHOLD ->
@@ -78,10 +95,15 @@ MAX_PENDING_PAIRS = max(
 )
 INFERENCE_POOL = ThreadPoolExecutor(max_workers=INFERENCE_WORKERS, thread_name_prefix="qr-inference")
 PENDING_SLOTS = BoundedSemaphore(MAX_PENDING_PAIRS)
+# Independent stages of one pair (house ID OCR of both photos, orientation and
+# the matcher) run concurrently on this pool; results are still applied in the
+# original order, so decisions are unchanged. Separate from INFERENCE_POOL so a
+# pair waiting on its stages can never block the stages themselves.
+STAGE_POOL = ThreadPoolExecutor(max_workers=INFERENCE_WORKERS * 4, thread_name_prefix="qr-stage")
 
 CLASS_TO_REMARK = {
     "gap between plate and wall": "Gap between plate and wall; make sure the plate sits flush against the wall.",
-    "nails not proper": "nails are not properly fixed ; secure it with at least two properly fixed nails.",
+    "nails not proper": "Nails are not proper,fix properly",
     "rescan scanify image": "Rescan the Scanify image clearly.",
     "stick plate properly": "Stick plate properly.",
     "write o for owner and r1, r2 for rent": "Mark owner plates as O and rental plates as R1 or R2, as applicable.",
@@ -113,6 +135,8 @@ class ImagePair(BaseModel):
     HouseImage: str
     userId: int | str | None = None
     houseId: int | str | None = None
+    # House ID code, e.g. "HPSBA-C118430"; compared with the IDs stamped on both photos.
+    houseNo: str | None = None
     QRStatus: int | None = None
     Remark: str | None = None
 
@@ -146,6 +170,18 @@ def get_house_checker():
 
 
 @lru_cache(maxsize=1)
+def get_house_id_reader():
+    return HouseIdReader()
+
+
+def house_ids_mismatch(reference_id: str | None, property_id: str | None, house_no) -> bool:
+    """True when any two of the readable IDs (both photo stamps + houseNo) differ."""
+    ids = [reference_id, property_id, normalize_id(house_no)]
+    keys = {comparison_key(i) for i in ids if i}
+    return len(keys) > 1
+
+
+@lru_cache(maxsize=1)
 def get_orientation_checker():
     return OrientationChecker(device=DEVICE)
 
@@ -155,7 +191,7 @@ def get_plate_detector():
     return PlateDetector(device=DEVICE)
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def get_model(path: str):
     return YOLO(path)
 
@@ -204,10 +240,46 @@ def result(images: ImagePair, qr_status=None, remark=None, manual_review=False, 
         response["userId"] = images.userId
     if images.houseId is not None:
         response["houseId"] = images.houseId
+    if images.houseNo is not None:
+        response["houseNo"] = images.houseNo
     return response
 
 
+def legacy_top_class(reference: Image.Image) -> tuple[str, float] | None:
+    """Top class and its average probability from the legacy (pre-retraining) models."""
+    predictions = []
+    for path in LEGACY_SHOP_MODEL_PATHS:
+        if not path.is_file():
+            continue
+        output = get_model(str(path)).predict(source=reference, device=DEVICE, verbose=False)[0]
+        probabilities = output.probs.data.detach().cpu().numpy().astype(float)
+        predictions.append({str(output.names[i]): float(probabilities[i]) for i in range(len(probabilities))})
+    if not predictions:
+        return None
+    averages = {
+        label: float(np.mean([scores.get(label, 0.0) for scores in predictions]))
+        for label in set().union(*predictions)
+    }
+    highest = max(averages, key=averages.get)
+    return highest, averages[highest]
+
+
 def inspect_reference(reference: Image.Image, images: ImagePair):
+    legacy = legacy_top_class(reference)
+    if legacy is not None:
+        legacy_class, legacy_confidence = legacy
+        if "shop" in legacy_class.casefold():
+            return result(
+                images, qr_status=None, remark=images.Remark, manual_review=True,
+                reason=(
+                    f"Inspector classified the plate as 'Shops' ({legacy_confidence:.0%} confidence); "
+                    "this category needs manual review."
+                ),
+            )
+        # The legacy models were better at plates on trees/poles: trust a
+        # confident REMOVE PLATES from them (good held-out plates scored <= 0.52).
+        if legacy_class.strip().casefold() == "remove plates" and legacy_confidence >= LEGACY_REMOVE_PLATES_THRESHOLD:
+            return result(images, qr_status=0, remark=CLASS_TO_REMARK["remove plates"])
     predictions = []
     for name, path in MODEL_PATHS:
         if not path.is_file():
@@ -259,6 +331,24 @@ def inspect_reference(reference: Image.Image, images: ImagePair):
     return result(images, qr_status=0, remark=remark)
 
 
+@app.on_event("startup")
+def warm_up_models():
+    """Load every model (and run each once) at startup, so the first request is
+    as fast as later ones instead of paying several seconds of lazy loading."""
+    if os.getenv("QR_SKIP_WARMUP"):
+        return
+    blank = Image.new("RGB", (762, 1016), (200, 200, 200))
+    get_house_id_reader().read(blank)
+    get_orientation_checker().sideways_probability(blank)
+    get_matcher()._region_detections(blank, "qr code . plate .")
+    get_plate_detector().detect(blank)
+    for _name, path in MODEL_PATHS:
+        if path.is_file():
+            get_model(str(path)).predict(source=blank, device=DEVICE, verbose=False)
+    legacy_top_class(blank)
+    get_house_checker().check(blank)
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "device": DEVICE}
@@ -297,19 +387,48 @@ def process_pair(images: ImagePair):
         raise HTTPException(422, "HouseImage must contain a base64 encoded image.")
     reference = decode_image(images.QRCodeImage, "QRCodeImage")
     property_image = decode_image(images.HouseImage, "HouseImage")
+    is_landscape = property_image.width > property_image.height * HORIZONTAL_ASPECT_RATIO
+    reader, orientation, matcher = get_house_id_reader(), get_orientation_checker(), get_matcher()
+    # Start the independent stages together. The matcher is started speculatively;
+    # its result is only used if the earlier checks pass.
+    reference_id = STAGE_POOL.submit(reader.read, reference)
+    property_id = STAGE_POOL.submit(reader.read, property_image)
+    closeup = STAGE_POOL.submit(plate_closeup_fraction, property_image)
+    sideways = STAGE_POOL.submit(
+        lambda: any(orientation.sideways_probability(img) >= SIDEWAYS_THRESHOLD for img in (reference, property_image))
+    )
+    matching = None if is_landscape else STAGE_POOL.submit(matcher.verify_presence, reference, property_image)
+
+    # First task: the house IDs must agree; on a mismatch no other task runs.
+    try:
+        if house_ids_mismatch(reference_id.result(), property_id.result(), images.houseNo):
+            if matching is not None:
+                matching.cancel()  # skips the matcher if it has not started yet
+            return result(images, qr_status=0, remark=HOUSE_ID_MISMATCH_REMARK)
+    except Exception as exc:
+        raise HTTPException(500, f"House ID check failed: {exc}") from exc
     # Property photos must be taken in portrait (vertical) orientation.
-    if property_image.width > property_image.height * HORIZONTAL_ASPECT_RATIO:
+    if is_landscape:
         return result(images, qr_status=0, remark=HORIZONTAL_IMAGE_REMARK)
     # Portrait files can still hold a sideways scene (photo taken horizontally).
     # Checked on both photos before matching, which a rotated photo would fail.
     try:
-        orientation = get_orientation_checker()
-        if any(orientation.sideways_probability(img) >= SIDEWAYS_THRESHOLD for img in (reference, property_image)):
+        if sideways.result():
+            if matching is not None:
+                matching.cancel()
             return result(images, qr_status=0, remark=HORIZONTAL_IMAGE_REMARK)
     except Exception as exc:
         raise HTTPException(500, f"Orientation check failed: {exc}") from exc
+    # The property image must show the house, not a close-up of the plate.
     try:
-        match = get_matcher().verify_presence(reference, property_image)
+        if closeup.result() >= PLATE_CLOSEUP_THRESHOLD:
+            if matching is not None:
+                matching.cancel()
+            return result(images, qr_status=0, remark=HOUSE_IMAGE_REMARK)
+    except Exception as exc:
+        raise HTTPException(500, f"Property image check failed: {exc}") from exc
+    try:
+        match = matching.result()
     except HTTPException:
         raise
     except Exception as exc:

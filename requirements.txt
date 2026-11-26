@@ -9,3 +9,4 @@ pillow
 fastapi
 uvicorn[standard]
 ultralytics
+rapidocr-onnxruntime

@@ -1,4 +1,6 @@
+import hashlib
 import logging
+import os
 import threading
 
 import cv2
@@ -10,6 +12,10 @@ from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 import bgcontext
 
 logger = logging.getLogger(__name__)
+
+# _find_qr_boxes results keyed by image content (insertion-ordered, small).
+_QR_CACHE = {}
+_QR_CACHE_LOCK = threading.Lock()
 
 class HybridImageMatcher:
     # Combined wall + plate-fingerprint score (see bgcontext.py). Tuned on
@@ -34,6 +40,21 @@ class HybridImageMatcher:
         # matching misses, and use cached files only so offline runs stay usable.
         self.processor = None
         self.model = None
+        # QR candidate source when template matching misses:
+        #   "dino" - Grounding DINO (~3 s on CPU);
+        #   "yolo" - the plate detector only (~0.03 s);
+        #   "auto" - the plate detector first; DINO only when it is not confident.
+        self.candidate_source = os.getenv("QR_MATCHER_DETECTOR", "auto").strip().lower()
+        # Score cut-offs per detector: any candidate / box-checkable / confident.
+        self.thresholds = {
+            "dino": (0.18, 0.28, 0.33),
+            "yolo": (
+                float(os.getenv("QR_YOLO_MIN", "0.10")),
+                float(os.getenv("QR_YOLO_PLAUSIBLE", "0.30")),
+                float(os.getenv("QR_YOLO_CONFIDENT", "0.55")),
+            ),
+        }
+        self._plate_detector = None
         self.qr_detector = cv2.QRCodeDetector()
         self.orb = cv2.ORB_create(nfeatures=8000, scaleFactor=1.15, nlevels=10, edgeThreshold=8, fastThreshold=7)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
@@ -65,7 +86,25 @@ class HybridImageMatcher:
         return float(score) if plate_like else 0.0
 
     def _find_qr_boxes(self, rgb_image):
-        """Locate QR symbols without reading or comparing their payloads."""
+        """Locate QR symbols without reading or comparing their payloads.
+
+        verify_presence searches the same reference image twice; the result is
+        cached by image content so the slow multi-scale search runs once.
+        """
+        rgb_image = np.ascontiguousarray(rgb_image)
+        key = (rgb_image.shape, hashlib.blake2b(rgb_image.data, digest_size=16).digest())
+        with _QR_CACHE_LOCK:
+            cached = _QR_CACHE.get(key)
+        if cached is not None:
+            return [list(b) for b in cached]
+        boxes = self._find_qr_boxes_uncached(rgb_image)
+        with _QR_CACHE_LOCK:
+            _QR_CACHE[key] = [list(b) for b in boxes]
+            while len(_QR_CACHE) > 32:
+                _QR_CACHE.pop(next(iter(_QR_CACHE)))
+        return boxes
+
+    def _find_qr_boxes_uncached(self, rgb_image):
         gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
         boxes = []
         for scale in (1.0, 1.5, 2.0, 2.5, 3.0):
@@ -265,6 +304,14 @@ class HybridImageMatcher:
         ]
 
     def _region_detections(self, image, prompt):
+        if self.candidate_source in ("yolo", "auto"):
+            self._local.detector_mode = "yolo"
+            candidates = self._plate_detector_candidates(image)
+            confident = self.thresholds["yolo"][2]
+            if self.candidate_source == "yolo" or any(c["score"] >= confident for c in candidates):
+                return candidates
+        # Grounding DINO (always for "dino"; for "auto" when the plate detector is unsure).
+        self._local.detector_mode = "dino"
         if self.processor is None or self.model is None:
             self.processor = AutoProcessor.from_pretrained(
                 "IDEA-Research/grounding-dino-tiny", local_files_only=True
@@ -286,6 +333,40 @@ class HybridImageMatcher:
             {"box": box, "score": float(score), "label": str(label).casefold()}
             for box, score, label in zip(boxes, scores, labels)
         ]
+
+    def _mode(self):
+        """Detector that produced this request's candidates ("dino" or "yolo")."""
+        return getattr(self._local, "detector_mode", None) or ("yolo" if self.candidate_source == "yolo" else "dino")
+
+    @property
+    def det_min(self):
+        return self.thresholds[self._mode()][0]
+
+    @property
+    def det_plausible(self):
+        return self.thresholds[self._mode()][1]
+
+    @property
+    def det_confident(self):
+        return self.thresholds[self._mode()][2]
+
+    def _plate_detector_candidates(self, image):
+        """QR-box candidates from the plate detector, in _region_detections' format.
+
+        The detector boxes the whole plate (QR on the left, text panel on the
+        right); its training labels were QR box w x h expanded to
+        [x1 - 0.1w, y1 - 0.15h, x2 + 1.35w, y2 + 0.15h], which is inverted here.
+        """
+        if self._plate_detector is None:
+            from plate_detector import PlateDetector
+            self._plate_detector = PlateDetector(device=self.device)
+        out = []
+        for score, (px1, py1, px2, py2) in self._plate_detector.detect(image, min_conf=self.thresholds["yolo"][0]):
+            w = (px2 - px1) / 2.45
+            h = (py2 - py1) / 1.30
+            qx1, qy1 = px1 + 0.1 * w, py1 + 0.15 * h
+            out.append({"box": np.array([qx1, qy1, qx1 + w, qy1 + h]), "score": float(score), "label": "qr code"})
+        return out
 
     def _regions(self, image, prompt):
         """Compatibility helper returning only detected boxes."""
@@ -431,16 +512,22 @@ class HybridImageMatcher:
 
         self._local.candidates = []
         self._local.qr_min_area = None
+        self._local.qr_max_score = None
         self._local.qr_confident = None
+        self._local.detector_mode = None
         try:
             result = self._verify_presence_core(ref_img, property_img, target_prompt)
             candidates = self._local.candidates
             qr_min_area = self._local.qr_min_area
+            qr_max_score = self._local.qr_max_score
             qr_confident = self._local.qr_confident
+            detector_mode = self._mode()
         finally:
             self._local.candidates = None
             self._local.qr_min_area = None
+            self._local.qr_max_score = None
             self._local.qr_confident = None
+            self._local.detector_mode = None
         if not result.get("contains_reference") and candidates:
             plates = [c for c in candidates if c["plate_like"]]
             best = max(plates, key=lambda c: c["score"]) if plates else None
@@ -501,7 +588,7 @@ class HybridImageMatcher:
             out["qr_box_area"] = qr_min_area
             return out
         if result.get("recognition_uncertain"):
-            return self._decide_by_qr_size(qr_min_area, result.get("detection_method"))
+            return self._decide_by_qr_size(qr_min_area, result.get("detection_method"), qr_max_score, detector_mode)
         if result.get("detection_method") == "QR symbol not localized; use clearer original images":
             return self._reject(self.REMARK_RESCAN, result["detection_method"])
         return result
@@ -519,9 +606,18 @@ class HybridImageMatcher:
     def _reject(remark, method):
         return {"contains_reference": False, "detection_method": method, "reject_remark": remark}
 
-    def _decide_by_qr_size(self, qr_min_area, method):
-        """Accept/reject a plate the matcher could not localize precisely."""
-        if qr_min_area is not None and qr_min_area < self.QR_SMALL_AREA:
+    def _decide_by_qr_size(self, qr_min_area, method, qr_max_score=None, detector_mode="dino"):
+        """Accept/reject a plate the matcher could not localize precisely.
+
+        DINO also boxes house numbers and signs as "qr code" (large boxes), so a
+        small box means a real distant plate. The plate detector only outputs
+        plate-sized boxes, so with it the detector's confidence decides instead.
+        """
+        if detector_mode == "yolo":
+            found = qr_max_score is not None and qr_max_score >= self.thresholds["yolo"][2]
+        else:
+            found = qr_min_area is not None and qr_min_area < self.QR_SMALL_AREA
+        if found:
             return {
                 "contains_reference": True,
                 "background_checked": False,
@@ -702,15 +798,17 @@ class HybridImageMatcher:
                 detections = self._region_detections(match_property, dino_prompt)
                 plausible = []
                 qr_detections = [
-                    d for d in detections if "qr code" in d["label"] and d["score"] >= .18
+                    d for d in detections if "qr code" in d["label"] and d["score"] >= self.det_min
                 ]
+                if qr_detections and hasattr(self._local, "qr_max_score"):
+                    self._local.qr_max_score = max(d["score"] for d in qr_detections)
                 if qr_detections and hasattr(self._local, "qr_min_area"):
                     self._local.qr_min_area = min(
                         max(0.0, float(d["box"][2] - d["box"][0])) * max(0.0, float(d["box"][3] - d["box"][1]))
                         for d in qr_detections
                     ) / float(width * height)
                 for detection in detections:
-                    if "qr code" not in detection["label"] or detection["score"] < .28:
+                    if "qr code" not in detection["label"] or detection["score"] < self.det_plausible:
                         continue
                     x1, y1, x2, y2 = np.rint(detection["box"]).astype(int)
                     x1, y1 = max(0, x1), max(0, y1)
@@ -725,11 +823,11 @@ class HybridImageMatcher:
                         continue
                     plausible.append((detection["score"], [x1, y1, x2, y2]))
 
-                if plausible and max(plausible)[0] >= .33 and hasattr(self._local, "qr_confident"):
+                if plausible and max(plausible)[0] >= self.det_confident and hasattr(self._local, "qr_confident"):
                     self._local.qr_confident = max(plausible)
                 best_dino = None
                 for detection_score, candidate_box in sorted(plausible, reverse=True):
-                    if detection_score < .33:
+                    if detection_score < self.det_confident:
                         return {
                             "contains_reference": False,
                             "recognition_uncertain": True,

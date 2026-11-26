@@ -1,8 +1,11 @@
 """Build the accept/reject rule classification dataset.
 
-Sources (all read-only):
-  * Documents/rejection rules data train/<rule>/   - new reject rule folders
-  * Documents/Acc, Accept, Accept-, accept--       - accepted plate + "-House" pairs
+Sources (all read-only), under QR_DATA_ROOT
+(default ~/Downloads/Images for qr plate and qr plate house):
+  * rejection rules data train/<rule>/, Rejection plate photos 1/<rule>/,
+    BHIWANDI, SOLAPUR, Ahilyanagar and New folder sub-folders - reject rules
+    (folder names are mapped onto the inspector classes by CLASS_ALIASES)
+  * Acc, Accept, Accept-, accept--                  - accepted plate + "-House" pairs
   * the older prepared dataset the shipped models were trained on (optional)
 
 Output: training/data/prepared/{train,val,test}/<class>/  plus
@@ -13,6 +16,7 @@ Images are split by house ID, so a plate photo and its property photo
 never end up on both sides of the split.
 """
 import hashlib
+import os
 import json
 import random
 import re
@@ -22,8 +26,15 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 HERE = Path(__file__).resolve().parent
-DOCS = Path.home() / "Documents"
+DOCS = Path(os.getenv("QR_DATA_ROOT", Path.home() / "Downloads" / "Images for qr plate and qr plate house"))
 REJECT_ROOT = DOCS / "rejection rules data train"
+EXTRA_REJECT_ROOTS = [
+    DOCS / "Rejection plate photos 1",
+    DOCS / "BHIWANDI" / "BHIWANDI",
+    DOCS / "SOLAPUR" / "SOLAPUR",
+    DOCS / "Ahilyanagar" / "Ahilyanagar",
+    DOCS / "New folder",
+]
 ACCEPT_DIRS = [DOCS / n for n in ("Accept", "Acc", "Accept-", "accept--")]
 OLD_PREPARED = Path.home() / "Downloads" / "data train classification and yolo" / \
     "QR_House_Plate_AI_Inspector_Hybrid_v2" / "data" / "prepared"
@@ -32,7 +43,7 @@ HOLDOUT = HERE / "data" / "holdout_accept"
 
 SEED = 42
 ACCEPT_CLASS = "Accept+"
-ACCEPT_TRAIN_GROUPS = 600      # ~1200 accept images (plate + house) for training
+ACCEPT_TRAIN_GROUPS = 600      # per house-ID series (D and I): ~2400 accept images
 HOLDOUT_GROUPS = 300           # accept pairs reserved for false-reject testing
 MAX_SIDE = 640
 EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".webp"}
@@ -40,15 +51,56 @@ EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".webp"}
 # Folders that describe the same rule are trained as one class.
 CLASS_ALIASES = {
     "write r1,r2 or o1, o2 on plate": "Write O for owner and R1, R2 for Rent",
+    "write r1 and r2 and o1 and o2 on plate": "Write O for owner and R1, R2 for Rent",
+    "write o1,o2 or r1,r2 on plate": "Write O for owner and R1, R2 for Rent",
     "rescan properly scanify image": "Rescan Scanify Image",
+    "rescan scanify image": "Rescan Scanify Image",
+    "rescan properly": "Rescan Scanify Image",
+    "rescan proper scanify image": "Rescan Scanify Image",
+    "nails": "Nails Not Proper",
+    "nail not proper": "Nails Not Proper",
+    "nails not proper": "Nails Not Proper",
+    "damage plates": "plate is damaged After Installation",
+    "damage plate": "plate is damaged After Installation",
+    "damages plate": "plate is damaged After Installation",
+    "plate missing after installation": "PLATE MISSING AFTER INSTALLATION",
+    "plate not show in property image": "PLATE NOT VISIBLE IN PROPERTY IMAGE",
+    "plate not visible in property image": "PLATE NOT VISIBLE IN PROPERTY IMAGE",
+    "property image not proper": "Property Image not proper",
+    "remove dustbin stickers from doors and walls": "REMOVE DUSTBIN STICKER",
+    "remove dust bin sticker": "REMOVE DUSTBIN STICKER",
+    "remove dustbin sticker": "REMOVE DUSTBIN STICKER",
+    "remove plate": "REMOVE PLATES",
+    "remove plates": "REMOVE PLATES",
+    "remove plate when wall is crack": "REMOVE PLATE WHEN WALL IS CRACK",
+    "show house entrance": "SHOW HOUSE ENTRANCE",
+    "show property image long distance": "Show Property Image Long Distance",
+    "stick plate properly": "Stick plate properly",
+    "write house id no. on plate with marker": "WRITE HOUSE ID NO. ON PLATE WITH MARKER",
+    "write house id number on plate with marker": "WRITE HOUSE ID NO. ON PLATE WITH MARKER",
+    "scanify image and plate id mismatch": "HOUSE ID NO. MISSMATCH",
+    "mismatch house id and plate id": "HOUSE ID NO. MISSMATCH",
+    "mismatched id no": "HOUSE ID NO. MISSMATCH",
+    "house id no. missmatch": "HOUSE ID NO. MISSMATCH",
+    "scanify image and property image horizontal": "Horizontal Pictures",
+    "scan scanify image and property image horizontal": "Horizontal Pictures",
+    "horizontal pictures": "Horizontal Pictures",
+    "gap between plate and wall": "GAP BETWEEN PLATE AND WALL",
     "accept+": ACCEPT_CLASS,
+}
+# Rules handled outside the inspector (or without a class in the shipped
+# models) are not trained.
+SKIP_FOLDERS = {
+    "washroom", "remove plate from banner", "put plate plain surface wall",
+    "put plate properly", "show only one plate in property image", "scratch",
 }
 
 ID_RE = re.compile(r"(hpsba-[a-z]?\d+)", re.I)
 
 
 def canonical(name):
-    return CLASS_ALIASES.get(" ".join(name.split()).casefold(), " ".join(name.split()))
+    key = " ".join(name.split()).casefold()
+    return CLASS_ALIASES.get(key, " ".join(name.split()))
 
 
 def group_key(path, class_name):
@@ -100,6 +152,12 @@ def main():
     # 1. Collect reject images: new rule folders first, then old classes.
     class_files = {}   # class -> {hash: path}
     sources = [d for d in sorted(REJECT_ROOT.iterdir()) if d.is_dir()]
+    for root in EXTRA_REJECT_ROOTS:
+        if root.is_dir():
+            sources += [
+                d for d in sorted(root.iterdir())
+                if d.is_dir() and " ".join(d.name.split()).casefold() not in SKIP_FOLDERS
+            ]
     if OLD_PREPARED.is_dir():
         for split in ("train", "val", "test"):
             sources += [d for d in sorted((OLD_PREPARED / split).iterdir()) if d.is_dir()]
@@ -138,7 +196,13 @@ def main():
     keys = sorted(pairs)
     random.shuffle(keys)
     holdout_keys = keys[:HOLDOUT_GROUPS]
-    train_keys = keys[HOLDOUT_GROUPS:HOLDOUT_GROUPS + ACCEPT_TRAIN_GROUPS]
+    # Balance the house-ID series so I-series plates are as well represented
+    # as the (far more numerous) D-series ones.
+    by_series = {}
+    for k in keys[HOLDOUT_GROUPS:]:
+        m = re.match(r"hpsba-([a-z])", k)
+        by_series.setdefault(m.group(1) if m else "?", []).append(k)
+    train_keys = [k for ks in by_series.values() for k in ks[:ACCEPT_TRAIN_GROUPS]]
     accept_files = class_files.setdefault(ACCEPT_CLASS, {})
     for k in train_keys:
         for img in pairs[k]:
