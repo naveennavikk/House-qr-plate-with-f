@@ -4,44 +4,69 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#10151f">
-  <title>QR Plate Match and Inspect — Test</title>
-  <link rel="stylesheet" href="/static/styles.css?v=100">
+  <title>QR Plate House Check</title>
+  <link rel="stylesheet" href="/static/styles.css?v=203">
 </head>
 <body>
   <main class="shell">
     <header>
       <div class="logo" aria-hidden="true">QR</div>
       <div>
-        <p class="eyebrow">LOCAL TEST INTERFACE</p>
+        <p class="eyebrow">HOUSE QR PLATE CHECK</p>
         <h1>QR Plate Match &amp; Inspect</h1>
-        <p class="muted">Upload reference and property images. Matching starts when you submit.</p>
+        <p class="muted">Houses and photos are fetched from the house details API and checked automatically.</p>
       </div>
     </header>
 
-    <form id="batch-form">
-      <div class="section-heading">
-        <div><h2>Image pairs</h2><p class="muted">Add up to 100 properties to process together.</p></div>
-        <button id="add-pair" class="button secondary" type="button">+ Add pair</button>
+    <form id="fetch-form" class="toolbar">
+      <label class="date-label ulb-label">ULB<select id="ulb" required><option value="">Loading ULBs…</option></select></label>
+      <label class="date-label">From date<input id="from-day" type="date" required></label>
+      <label class="date-label">To date<input id="to-day" type="date" required></label>
+      <button id="submit" class="button primary" type="submit">Fetch &amp; check</button>
+      <button id="stop" class="button secondary hidden" type="button">Stop</button>
+      <div id="timer" class="timer hidden" aria-live="polite">
+        <span class="timer-main">Time: <b id="elapsed">0.0 s</b></span>
+        <span id="batch-times" class="batch-times"></span>
       </div>
-      <div id="pairs"></div>
-      <div class="submit-row">
-        <span id="progress" class="muted">Each pair is evaluated independently.</span>
-        <button id="submit" class="button primary" type="submit">Check images</button>
-      </div>
-      <div id="results" class="results" aria-live="polite"></div>
     </form>
-    <footer>Local demo interface. The images are sent to this app’s matching API on port 8000.</footer>
+
+    <div id="summary" class="summary hidden" aria-live="polite">
+      <span class="chip total"><b id="n-done">0</b> / <b id="n-total">0</b> checked</span>
+      <span class="chip approved"><b id="n-accepted">0</b> Accepted</span>
+      <span class="chip rejected"><b id="n-rejected">0</b> Rejected</span>
+      <span class="chip manual"><b id="n-manual">0</b> Manual review</span>
+      <span class="chip failed"><b id="n-error">0</b> Error</span>
+    </div>
+    <p id="progress" class="muted"></p>
+
+    <div class="filters hidden" id="filters" role="group" aria-label="Show">
+      <button type="button" class="filter active" data-filter="all">All</button>
+      <button type="button" class="filter" data-filter="Accepted">Accepted</button>
+      <button type="button" class="filter" data-filter="Rejected">Rejected</button>
+      <button type="button" class="filter" data-filter="Manual review">Manual review</button>
+      <button type="button" class="filter" data-filter="Error">Error</button>
+    </div>
+
+    <div id="results" class="house-list"></div>
+    <footer>Results are shown here only; nothing is written back to the house API.</footer>
   </main>
-  <template id="pair-template">
-    <section class="pair-card">
-      <div class="pair-top"><div><span class="pair-number"></span><span class="muted">Property image pair</span></div><button class="remove" type="button" aria-label="Remove image pair">Remove</button></div>
-      <label class="id-label">House ID <span class="optional">optional</span><input class="house-id" type="text" placeholder="e.g. 7044"></label>
-      <div class="upload-grid">
-        <label class="upload">Reference QR plate image<input class="qr-file" type="file" accept="image/*" required><img class="preview qr-preview hidden" alt="Reference plate preview"></label>
-        <label class="upload">Property image<input class="house-file" type="file" accept="image/*" required><img class="preview house-preview hidden" alt="Property preview"></label>
+
+  <template id="house-template">
+    <article class="house-card">
+      <div class="thumbs">
+        <figure><img class="qr-thumb" alt="Reference QR plate"><figcaption>QR plate</figcaption></figure>
+        <figure><img class="house-thumb" alt="Property"><figcaption>Property</figcaption></figure>
       </div>
-    </section>
+      <div class="house-info">
+        <div class="house-top">
+          <span><strong class="house-id"></strong> <span class="house-no"></span></span>
+          <span class="badge"></span>
+        </div>
+        <p class="meta"></p>
+        <p class="remark"></p>
+      </div>
+    </article>
   </template>
-  <script src="/static/app.js?v=102" defer></script>
+  <script src="/static/app.js?v=203" defer></script>
 </body>
 </html>

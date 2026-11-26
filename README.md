@@ -88,3 +88,34 @@ See [LOAD_TEST_REPORT.md](LOAD_TEST_REPORT.md) for the local synthetic throughpu
 - `models/orientation_cls.pt` (`image_checks.py`) catches photos taken sideways: the file is portrait but the scene is rotated 90 degrees. Both images are checked before matching, and a sideways photo is rejected with the horizontal-image remark. Threshold: `QR_SIDEWAYS_THRESHOLD` (0.99). Retrain with `training/train_image_checks.py`.
 - House ID check (`house_id.py`, first task): the ID stamped at the bottom-left of each photo ("ID: HPSBA-C118430") is read with RapidOCR and compared with the optional request field `houseNo`. If any two readable IDs differ, the response is `QRStatus 0` with "House ID mismatch" and no other task runs. I/1 and O/0, spaces and case are ignored when comparing; an ID that cannot be read is skipped.
 - Speed: per pair, the house ID OCR, the orientation check and the matcher run in parallel (results are applied in the same order). Models load at startup (`QR_SKIP_WARMUP=1` skips this). When template matching misses, the matcher uses the fast plate detector first and falls back to Grounding DINO only when the detector is not confident (`QR_MATCHER_DETECTOR=auto`, the default; `dino` restores the DINO-only behaviour). On 374 labelled pairs this gave the same decision as DINO-only for 369 and cut the median response time from about 3.3 s to 2.1 s on CPU.
+
+## Checking houses from the house details API
+
+The web page (http://localhost:8000/) no longer takes uploads. Pick a ULB
+(the dropdown is loaded from `AllULBListForWeightCollection`; the ULB's `appid`
+is sent as the `AppId` header), a From and To date, and press **Fetch & check**: the server calls the house details API, runs every
+house's `QRCodeImage` (reference plate) and `HouseImage` (property photo)
+through the same checks as `POST /api/inspect` (with `ReferanceId` as the
+house number), and the page shows each house as soon as it is checked:
+house number, house ID, Accepted / Rejected / Manual review, and the remark.
+Results are only shown, not written back.
+
+Endpoints: `GET /api/ulbs` (ULB list) and `GET /api/houses/check?appId=3098&fromDate=YYYY-MM-DD&toDate=YYYY-MM-DD` (one JSON line per house).
+The house API takes everything as request headers: `AppId`, `UserId`, `FromDate`, `ToDate`, `SearchString`.
+
+Settings (environment variables, see `house_source.py`):
+
+| Variable | Default |
+|---|---|
+| `HOUSE_SOURCE_URL` | `https://weight.ictsbm.com/api/Get/GetHouseDetailsByDate` |
+| `HOUSE_SOURCE_APP_ID` | `3098` (used only when no ULB is chosen) |
+| `ULB_LIST_URL` | `https://weight.ictsbm.com/api/Get/AllULBListForWeightCollection` |
+| `HOUSE_SOURCE_USER_ID` | `-1` (all users) |
+| `HOUSE_SOURCE_HEADERS` | none; JSON of extra headers |
+| `HOUSE_SOURCE_TIMEOUT` | `600` seconds (the house API can take minutes) |
+| `HOUSE_SOURCE_DATE_FORMAT` | `%Y-%m-%d` |
+| `HOUSE_BATCH_SIZE` | `100` (houses checked per batch; the page shows each batch's time) |
+
+```bash
+HOUSE_SOURCE_APP_ID=3098 .venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000
+```

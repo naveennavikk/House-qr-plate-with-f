@@ -2,8 +2,11 @@
 
 import base64
 import binascii
+import json
 import os
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import date
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -11,9 +14,9 @@ from threading import BoundedSemaphore
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field, RootModel
@@ -21,6 +24,7 @@ from ultralytics import YOLO
 
 from house_checker import HouseDoorChecker
 from house_id import HouseIdReader, comparison_key, normalize_id
+from house_source import SourceError, fetch_houses, fetch_ulbs
 from image_checks import OrientationChecker, plate_closeup_fraction
 from matcher import HybridImageMatcher
 from plate_detector import PlateDetector
@@ -544,3 +548,127 @@ def batch_endpoint_help():
         ],
         "also_accepts_items_wrapper": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Houses from the ICTSBM house details API (house_source.py): every house of a
+# day is fetched server side and run through process_pair, exactly like a
+# POST /api/inspect request. Results are streamed to the page one line (JSON)
+# per house as soon as each house is checked; nothing is written back.
+
+THUMB_SIZE = 220
+
+
+def thumbnail(value) -> str | None:
+    """Small JPEG data URL of a base64 photo for the results page (None if unreadable)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        image = decode_image(value, "image")
+    except HTTPException:
+        return None
+    image.thumbnail((THUMB_SIZE, THUMB_SIZE))
+    buffer = BytesIO()
+    image.save(buffer, "JPEG", quality=70)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def check_house(index: int, record: dict) -> dict:
+    row = {
+        "index": index,
+        "houseId": record.get("houseId"),
+        "userId": record.get("userId"),
+        "houseNo": record.get("ReferanceId"),
+        "employee": record.get("qrEmpName"),
+        "modified": record.get("modified"),
+        "propertyType": record.get("PropertyType"),
+        "masterId": record.get("MasterId"),
+        "qrThumb": thumbnail(record.get("QRCodeImage")),
+        "houseThumb": thumbnail(record.get("HouseImage")),
+    }
+    started = time.perf_counter()
+    missing = [name for name in ("QRCodeImage", "HouseImage") if not str(record.get(name) or "").strip()]
+    if missing:
+        row.update(status="Error", QRStatus=None, Remark=f"Missing {' and '.join(missing)} in the house API data.")
+        return row
+    try:
+        pair = ImagePair(
+            QRCodeImage=record["QRCodeImage"],
+            HouseImage=record["HouseImage"],
+            userId=record.get("userId"),
+            houseId=record.get("houseId"),
+            houseNo=record.get("ReferanceId"),
+        )
+        outcome = process_pair(pair)
+    except HTTPException as exc:
+        row.update(status="Error", QRStatus=None, Remark=str(exc.detail))
+    except Exception as exc:  # noqa: BLE001 - one bad house must not stop the others
+        row.update(status="Error", QRStatus=None, Remark=f"Image analysis failed: {exc}")
+    else:
+        status = "Manual review" if outcome.get("manual_review") else {1: "Accepted", 0: "Rejected"}.get(outcome.get("QRStatus"), "Manual review")
+        row.update(status=status, QRStatus=outcome.get("QRStatus"), Remark=outcome.get("Remark"))
+    row["seconds"] = round(time.perf_counter() - started, 2)
+    return row
+
+
+HOUSE_BATCH_SIZE = int(os.getenv("HOUSE_BATCH_SIZE", "100"))
+
+
+def stream_house_checks(records: list[dict]):
+    """Check the houses in batches of HOUSE_BATCH_SIZE; one JSON line per house and per finished batch."""
+    total_started = time.perf_counter()
+    batches = [records[i:i + HOUSE_BATCH_SIZE] for i in range(0, len(records), HOUSE_BATCH_SIZE)]
+    yield json.dumps({"type": "start", "count": len(records), "batchSize": HOUSE_BATCH_SIZE, "batches": len(batches)}) + "\n"
+    pending = set()
+    try:
+        for number, batch in enumerate(batches, start=1):
+            batch_started = time.perf_counter()
+            offset = (number - 1) * HOUSE_BATCH_SIZE
+            queue = list(enumerate(batch, start=offset))
+            queue.reverse()
+            while queue or pending:
+                # Keep the shared inference pool busy without exceeding its pending limit.
+                while queue and (PENDING_SLOTS.acquire(blocking=False) if pending else PENDING_SLOTS.acquire(timeout=60)):
+                    index, record = queue.pop()
+                    future = INFERENCE_POOL.submit(check_house, index, record)
+                    future.add_done_callback(lambda _: PENDING_SLOTS.release())
+                    pending.add(future)
+                if not pending:
+                    continue
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    yield json.dumps({"type": "house", "batch": number, **future.result()}) + "\n"
+            seconds = round(time.perf_counter() - batch_started, 1)
+            yield json.dumps({"type": "batch", "batch": number, "count": len(batch), "seconds": seconds}) + "\n"
+    finally:
+        for future in pending:  # page closed: drop houses that have not started
+            future.cancel()
+    yield json.dumps({"type": "done", "seconds": round(time.perf_counter() - total_started, 1)}) + "\n"
+
+
+@app.get("/api/ulbs")
+def list_ulbs():
+    """ULBs for the page's dropdown: [{"name": ..., "appId": ...}]."""
+    try:
+        return fetch_ulbs()
+    except SourceError as exc:
+        raise HTTPException(502, str(exc)) from None
+
+
+@app.get("/api/houses/check")
+def check_houses(
+    app_id: int | None = Query(None, alias="appId"),
+    from_day: date = Query(alias="fromDate"),
+    to_day: date | None = Query(None, alias="toDate"),
+    search: str = Query("", alias="search"),
+):
+    """Fetch the houses between fromDate and toDate from the house API and check every one
+    (streamed, one JSON line per house)."""
+    to_day = to_day or from_day
+    if to_day < from_day:
+        raise HTTPException(422, "toDate must not be before fromDate.")
+    try:
+        records = fetch_houses(from_day, to_day, search, app_id)
+    except SourceError as exc:
+        raise HTTPException(502, str(exc)) from None
+    return StreamingResponse(stream_house_checks(records), media_type="application/x-ndjson")

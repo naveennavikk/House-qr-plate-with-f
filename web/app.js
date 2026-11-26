@@ -1,82 +1,189 @@
-const form=document.querySelector("#batch-form");
-const list=document.querySelector("#pairs");
-const template=document.querySelector("#pair-template");
-const addButton=document.querySelector("#add-pair");
-const submitButton=document.querySelector("#submit");
-const results=document.querySelector("#results");
-const progress=document.querySelector("#progress");
-const maxPairs=100;
+const form = document.querySelector("#fetch-form");
+const fromInput = document.querySelector("#from-day");
+const toInput = document.querySelector("#to-day");
+const ulbSelect = document.querySelector("#ulb");
+const ULB_KEY = "qr-check-ulb";
+const submitButton = document.querySelector("#submit");
+const stopButton = document.querySelector("#stop");
+const results = document.querySelector("#results");
+const progress = document.querySelector("#progress");
+const summary = document.querySelector("#summary");
+const filters = document.querySelector("#filters");
+const template = document.querySelector("#house-template");
 
-function refreshRows(){
-  [...list.querySelectorAll(".pair-card")].forEach((card,index)=>{
-    card.querySelector(".pair-number").textContent=`${index+1}.`;
-    card.querySelector(".remove").disabled=list.children.length===1;
+const KIND = { Accepted: "approved", Rejected: "rejected", "Manual review": "manual", Error: "failed" };
+const COUNTER = { Accepted: "#n-accepted", Rejected: "#n-rejected", "Manual review": "#n-manual", Error: "#n-error" };
+const timer = document.querySelector("#timer");
+const elapsedLabel = document.querySelector("#elapsed");
+const batchTimes = document.querySelector("#batch-times");
+let controller = null;
+let activeFilter = "all";
+let ticker = null;
+
+function startTimer() {
+  const started = performance.now();
+  batchTimes.replaceChildren();
+  timer.classList.remove("hidden");
+  elapsedLabel.textContent = "0.0 s";
+  ticker = setInterval(() => {
+    elapsedLabel.textContent = `${((performance.now() - started) / 1000).toFixed(1)} s`;
+  }, 100);
+}
+
+function stopTimer(finalSeconds) {
+  clearInterval(ticker);
+  ticker = null;
+  if (finalSeconds !== undefined) elapsedLabel.textContent = `${finalSeconds} s`;
+}
+
+function addBatchTime(message) {
+  const item = document.createElement("span");
+  item.textContent = `Batch ${message.batch} (${message.count} houses): ${message.seconds} s`;
+  batchTimes.append(item);
+}
+
+fromInput.value = toInput.value = new Date().toISOString().slice(0, 10);
+
+async function loadUlbs() {
+  try {
+    const response = await fetch("/api/ulbs");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || `Request failed (${response.status})`);
+    let saved = null;
+    try { saved = localStorage.getItem(ULB_KEY); } catch {}
+    const placeholder = new Option("Select a ULB…", "");
+    placeholder.disabled = true;
+    ulbSelect.replaceChildren(placeholder, ...payload.map((u) => new Option(`${u.name} (${u.appId})`, u.appId)));
+    ulbSelect.value = payload.some((u) => String(u.appId) === saved) ? saved : "";
+  } catch (error) {
+    ulbSelect.replaceChildren(new Option("Could not load ULBs", ""));
+    showError(`Could not load the ULB list: ${error.message}`);
+  }
+}
+
+ulbSelect.addEventListener("change", () => {
+  try { localStorage.setItem(ULB_KEY, ulbSelect.value); } catch {}
+});
+loadUlbs();
+
+function bump(selector) {
+  const el = document.querySelector(selector);
+  el.textContent = Number(el.textContent) + 1;
+}
+
+function resetSummary(total) {
+  for (const sel of ["#n-done", ...Object.values(COUNTER)]) document.querySelector(sel).textContent = "0";
+  document.querySelector("#n-total").textContent = total;
+  summary.classList.remove("hidden");
+  filters.classList.remove("hidden");
+}
+
+function setImage(img, src) {
+  if (src) img.src = src;
+  else img.closest("figure").classList.add("empty");
+}
+
+function addHouse(house) {
+  const card = template.content.firstElementChild.cloneNode(true);
+  const status = house.status || "Error";
+  card.classList.add(KIND[status] || "failed");
+  card.dataset.status = status;
+  card.style.order = house.index;
+  setImage(card.querySelector(".qr-thumb"), house.qrThumb);
+  setImage(card.querySelector(".house-thumb"), house.houseThumb);
+  card.querySelector(".house-id").textContent = `House ID ${house.houseId ?? "—"}`;
+  card.querySelector(".house-no").textContent = house.houseNo || "(no house number)";
+  card.querySelector(".badge").textContent = status;
+  const meta = [`User ${house.userId ?? "—"}`, `Batch ${house.batch ?? 1}`];
+  if (house.propertyType) meta.push(house.propertyType);
+  if (house.employee) meta.push(house.employee);
+  if (house.seconds !== undefined) meta.push(`${house.seconds}s`);
+  card.querySelector(".meta").textContent = meta.join(" · ");
+  card.querySelector(".remark").textContent =
+    house.Remark || (status === "Accepted" ? "Plate matched and inspection passed." : "");
+  card.hidden = activeFilter !== "all" && activeFilter !== status;
+  results.append(card);
+  bump("#n-done");
+  if (COUNTER[status]) bump(COUNTER[status]);
+}
+
+function showError(message) {
+  const card = document.createElement("article");
+  card.className = "house-card failed message";
+  card.textContent = message;
+  results.append(card);
+}
+
+filters.addEventListener("click", (event) => {
+  const button = event.target.closest(".filter");
+  if (!button) return;
+  activeFilter = button.dataset.filter;
+  filters.querySelectorAll(".filter").forEach((b) => b.classList.toggle("active", b === button));
+  results.querySelectorAll(".house-card[data-status]").forEach((card) => {
+    card.hidden = activeFilter !== "all" && activeFilter !== card.dataset.status;
   });
-  addButton.disabled=list.children.length>=maxPairs;
-}
-
-function addPair(){
-  if(list.children.length>=maxPairs)return;
-  const card=template.content.firstElementChild.cloneNode(true);
-  card.querySelector(".remove").addEventListener("click",()=>{card.remove();refreshRows();});
-  for(const [inputSelector,previewSelector] of [[".qr-file",".qr-preview"],[".house-file",".house-preview"]]){
-    const input=card.querySelector(inputSelector),preview=card.querySelector(previewSelector);
-    input.addEventListener("change",()=>{
-      const file=input.files[0];
-      if(!file){preview.removeAttribute("src");preview.classList.add("hidden");return;}
-      preview.src=URL.createObjectURL(file);preview.classList.remove("hidden");
-    });
-  }
-  list.append(card);refreshRows();
-}
-
-function dataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(new Error(`Could not read ${file.name}`));reader.readAsDataURL(file);});}
-
-function showResults(items){
-  results.replaceChildren();
-  for(const item of items){
-    const card=document.createElement("article");
-    let kind="manual",title=`PAIR ${Number(item.index)+1} — REQUIRED MANUAL REVIEW`;
-    const reason=item.Remark||item.manual_review_reason;
-    let detail=reason?`Reason: ${reason} No status change was made.`:"No status change was made.";
-    if(item.success===false){kind="failed";title=`PAIR ${Number(item.index)+1} — INPUT/PROCESSING ERROR`;detail=item.error||"Could not process this pair.";}
-    else if(item.QRStatus===1){kind="approved";title=`PAIR ${Number(item.index)+1} — APPROVE`;detail="The plate matched and inspector accepted the reference image.";}
-    else if(item.QRStatus===0){kind="rejected";title=`PAIR ${Number(item.index)+1} — REJECT`;detail=item.Remark||"The pair did not pass inspection.";}
-    else if(item.houseId!==undefined&&item.houseId!==null){title=`PAIR ${Number(item.index)+1} — REQUIRED MANUAL REVIEW (House ${item.houseId})`;}
-    card.className=`result-card ${kind}`;
-    const heading=document.createElement("strong");heading.textContent=title;
-    const text=document.createElement("span");text.textContent=detail;
-    card.append(heading,text);results.append(card);
-  }
-}
-
-addButton.addEventListener("click",addPair);
-form.addEventListener("submit",async event=>{
-  event.preventDefault();
-  const cards=[...list.querySelectorAll(".pair-card")];
-  submitButton.disabled=true;addButton.disabled=true;submitButton.textContent="Processing…";
-  progress.textContent=`Sending ${cards.length} pair${cards.length===1?"":"s"} to the matcher…`;
-  results.replaceChildren();
-  try{
-    const items=await Promise.all(cards.map(async card=>{
-      const qr=card.querySelector(".qr-file").files[0],house=card.querySelector(".house-file").files[0];
-      if(!qr||!house)throw new Error("Select both a reference QR image and a property image for every pair.");
-      const item={QRCodeImage:await dataUrl(qr),HouseImage:await dataUrl(house)};
-      const houseId=card.querySelector(".house-id").value.trim();if(houseId)item.houseId=houseId;
-      return item;
-    }));
-    const response=await fetch("/api/inspect/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items})});
-    const payload=await response.json();
-    if(!response.ok)throw new Error(payload.detail?.map?.(e=>e.msg).join("; ")||payload.detail||`Request failed (${response.status})`);
-    showResults(payload.results||[]);progress.textContent=`Processed ${payload.count} pair${payload.count===1?"":"s"}.`;
-  }catch(error){
-    const card=document.createElement("article");card.className="result-card failed";
-    const heading=document.createElement("strong");heading.textContent="Could not check images";
-    const detail=document.createElement("span");detail.textContent=error.message;card.append(heading,detail);results.append(card);
-    progress.textContent="Correct the input and try again.";
-  }finally{
-    submitButton.disabled=false;submitButton.textContent="Check images";refreshRows();
-  }
 });
 
-addPair();
+stopButton.addEventListener("click", () => controller?.abort());
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  controller = new AbortController();
+  submitButton.disabled = true;
+  submitButton.textContent = "Checking…";
+  stopButton.classList.remove("hidden");
+  results.replaceChildren();
+  summary.classList.add("hidden");
+  const ulbName = ulbSelect.selectedOptions[0]?.textContent || "";
+  progress.textContent = `Fetching houses for ${ulbName} from the house details API…`;
+  startTimer();
+  try {
+    const response = await fetch(`/api/houses/check?appId=${encodeURIComponent(ulbSelect.value)}&fromDate=${encodeURIComponent(fromInput.value)}&toDate=${encodeURIComponent(toInput.value)}`, {
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || `Request failed (${response.status})`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        const message = JSON.parse(line);
+        if (message.type === "start") {
+          resetSummary(message.count);
+          progress.textContent = message.count
+            ? `${ulbName}: checking ${message.count} house${message.count === 1 ? "" : "s"} in ${message.batches} batch${message.batches === 1 ? "" : "es"} of up to ${message.batchSize}…`
+            : `${ulbName}: no houses found for these dates.`;
+        } else if (message.type === "house") {
+          addHouse(message);
+        } else if (message.type === "batch") {
+          addBatchTime(message);
+        } else if (message.type === "done") {
+          stopTimer(message.seconds);
+          progress.textContent = "All houses checked.";
+        }
+      }
+    }
+  } catch (error) {
+    if (error.name === "AbortError") progress.textContent = "Stopped.";
+    else {
+      progress.textContent = "";
+      showError(`Could not check houses: ${error.message}`);
+    }
+  } finally {
+    stopTimer();
+    submitButton.disabled = false;
+    submitButton.textContent = "Fetch & check";
+    stopButton.classList.add("hidden");
+    controller = null;
+  }
+});
