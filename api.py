@@ -15,14 +15,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, RootModel
 from PIL import Image, ImageOps, UnidentifiedImageError
+from pydantic import BaseModel, Field, RootModel
 from ultralytics import YOLO
 
 from house_checker import HouseDoorChecker
-from matcher import HybridImageMatcher
 from house_id import HouseIdReader, comparison_key, normalize_id
 from image_checks import OrientationChecker, plate_closeup_fraction
+from matcher import HybridImageMatcher
 from plate_detector import PlateDetector
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -519,7 +519,7 @@ def inspect_batch(batch: BatchRequest | BatchRecordList):
         except HTTPException as exc:
             item_result = result(images, qr_status=None, remark=images.Remark)
             item_result.update({"success": False, "error": str(exc.detail)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - one bad pair must not fail the whole batch
             item_result = result(images, qr_status=None, remark=images.Remark)
             item_result.update({"success": False, "error": f"Image analysis failed: {exc}"})
         item_result["index"] = index
